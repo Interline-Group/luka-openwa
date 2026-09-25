@@ -1,5 +1,40 @@
 import { BaileysLogger } from '../types/baileys.types';
 
+const LIBSIGNAL_SECRET_BEARING_MESSAGES = new Set([
+  'Closing session:',
+  'Opening session:',
+  'Removing old closed session:',
+  'Session already closed',
+]);
+
+let libsignalConsoleRedactionInstalled = false;
+
+export function redactLibsignalConsoleArgs(args: unknown[]): unknown[] {
+  if (typeof args[0] !== 'string' || !LIBSIGNAL_SECRET_BEARING_MESSAGES.has(args[0])) {
+    return args;
+  }
+  return [args[0], '[REDACTED_SESSION_STATE]'];
+}
+
+/**
+ * libsignal 6 writes Signal session objects directly to console.info/warn, bypassing Baileys' logger.
+ * Those objects contain private ratchet keys. Keep the operational message while dropping the object
+ * before Node's console formatter can serialize it.
+ */
+export function installLibsignalConsoleRedaction(): void {
+  if (libsignalConsoleRedactionInstalled) {
+    return;
+  }
+  libsignalConsoleRedactionInstalled = true;
+
+  for (const level of ['info', 'warn'] as const) {
+    const original = console[level].bind(console);
+    console[level] = (...args: unknown[]): void => {
+      original(...redactLibsignalConsoleArgs(args));
+    };
+  }
+}
+
 /** Fully silent logger so Baileys does not spam stdout; diagnostics flow via connection.update. */
 export function createSilentLogger(): BaileysLogger {
   const noop = (): void => {};
@@ -25,6 +60,8 @@ const BAILEYS_LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
  * captured with `BAILEYS_LOG_LEVEL=trace node dist/main > baileys-wire.log`.
  */
 export function createBaileysLogger(): BaileysLogger {
+  installLibsignalConsoleRedaction();
+
   const configured = (process.env.BAILEYS_LOG_LEVEL ?? 'silent').toLowerCase();
   if (!BAILEYS_LOG_LEVELS.includes(configured)) {
     return createSilentLogger();
