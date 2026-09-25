@@ -104,6 +104,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private shuttingDown = false;
   /** Periodic adoption sweep for sessions stranded by a rolling replacement. */
   private takeoverSweep?: ReturnType<typeof globalThis.setInterval>;
+  /** Sessions observed on a live peer at bootstrap; only these may be adopted after graceful release. */
+  private readonly deferredTakeoverCandidates = new Set<string>();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -181,14 +183,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
 
-    // A rolling replacement deliberately starts the new container before the old one exits. At
-    // bootstrap the old process still owns its sessions, so the one-shot auto-start scan must leave
-    // them alone. Once the old container exits its lease either gets released or expires; keep
-    // sweeping for those authenticated orphans so the replacement adopts them without operator
-    // intervention. claim() remains the final fence, so concurrent replacements cannot both start
-    // the same WhatsApp account.
+    // Capture ONLY sessions that are authenticated and live on a peer while this replacement boots.
+    // This is the evidence that distinguishes a rolling handoff from a deliberately stopped session:
+    // after graceful shutdown releaseAll() clears nodeId, so the database alone no longer remembers
+    // that the row was live on the predecessor. Keeping that fact in this process lets us adopt the
+    // exact handoff candidates without auto-resurrecting arbitrary stopped sessions.
+    void this.captureDeferredTakeoverCandidates();
     this.takeoverSweep = globalThis.setInterval(() => {
-      void this.recoverLapsedSessions();
+      void this.recoverRollingSessions();
     }, 15_000);
     this.takeoverSweep.unref?.();
 
@@ -260,31 +262,75 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
   }
 
-  private async recoverLapsedSessions(): Promise<void> {
+  private async captureDeferredTakeoverCandidates(): Promise<void> {
     if (this.shuttingDown || !this.ownership) return;
     try {
+      const heldIds = await this.ownership.heldByOtherNodes();
+      if (heldIds.length === 0) return;
+      const sessions = await this.sessionRepository.find({
+        where: { id: In(heldIds), phone: Not(IsNull()) },
+        select: { id: true },
+      });
+      for (const session of sessions) this.deferredTakeoverCandidates.add(session.id);
+      if (sessions.length > 0) {
+        this.logger.log(\`Deferred \${sessions.length} live peer session(s) for rolling takeover\`, {
+          action: 'rolling_recovery_deferred_candidates',
+          sessionIds: sessions.map(session => session.id),
+        });
+      }
+    } catch (error: unknown) {
+      this.logger.warn('Failed to capture rolling takeover candidates', {
+        action: 'rolling_recovery_capture_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async recoverRollingSessions(): Promise<void> {
+    if (this.shuttingDown || !this.ownership) return;
+    try {
+      // Crash path: a foreign owner remains recorded but its lease has expired.
       const lapsed = (await this.ownership.lapsedHeldByOthers()).filter(
         session => session.phone != null && session.status !== SessionStatus.CREATED,
       );
-      for (const session of lapsed) {
+      // Graceful rolling path: releaseAll() erased nodeId. Only ids witnessed on a live peer during
+      // this replacement's bootstrap are eligible, so a normal operator stop is never resurrected.
+      const deferredIds = [...this.deferredTakeoverCandidates];
+      const claimableDeferredIds = await this.ownership.claimable(deferredIds);
+      const deferred = claimableDeferredIds.length === 0
+        ? []
+        : await this.sessionRepository.find({
+            where: { id: In(claimableDeferredIds), phone: Not(IsNull()) },
+          });
+      const candidates = new Map<string, Session>();
+      for (const session of [...lapsed, ...deferred]) candidates.set(session.id, session);
+      for (const session of candidates.values()) {
         if (this.shuttingDown) return;
         try {
-          // A dead owner's READY/INITIALIZING status describes an engine that no longer exists.
-          // Reset only this lapsed row before start(); start() then atomically claims it.
           await this.sessionRepository.update(session.id, { status: SessionStatus.DISCONNECTED });
           await this.start(session.id);
-          this.logger.log(`Recovered lapsed session after rolling replacement: ${session.name}`, {
+          this.deferredTakeoverCandidates.delete(session.id);
+          this.logger.log(\`Recovered session after rolling replacement: \${session.name}\`, {
             sessionId: session.id,
             action: 'rolling_recovery_success',
           });
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
-          this.logger.warn(`Rolling recovery deferred for session: ${session.name}`, {
+          this.logger.warn(\`Rolling recovery deferred for session: \${session.name}\`, {
             sessionId: session.id,
             action: 'rolling_recovery_deferred',
             error: message,
           });
         }
+      }
+      // Logout/delete clears phone or removes the row. Such a candidate must never be resurrected.
+      if (deferredIds.length > 0) {
+        const stillAuthenticated = await this.sessionRepository.find({
+          where: { id: In(deferredIds), phone: Not(IsNull()) },
+          select: { id: true },
+        });
+        const keep = new Set(stillAuthenticated.map(session => session.id));
+        for (const id of deferredIds) if (!keep.has(id)) this.deferredTakeoverCandidates.delete(id);
       }
     } catch (error: unknown) {
       this.logger.warn('Rolling recovery sweep failed', {
