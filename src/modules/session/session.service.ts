@@ -273,7 +273,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       });
       for (const session of sessions) this.deferredTakeoverCandidates.add(session.id);
       if (sessions.length > 0) {
-        this.logger.log(\`Deferred \${sessions.length} live peer session(s) for rolling takeover\`, {
+        this.logger.log(`Deferred ${sessions.length} live peer session(s) for rolling takeover`, {
           action: 'rolling_recovery_deferred_candidates',
           sessionIds: sessions.map(session => session.id),
         });
@@ -310,13 +310,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           await this.sessionRepository.update(session.id, { status: SessionStatus.DISCONNECTED });
           await this.start(session.id);
           this.deferredTakeoverCandidates.delete(session.id);
-          this.logger.log(\`Recovered session after rolling replacement: \${session.name}\`, {
+          this.logger.log(`Recovered session after rolling replacement: ${session.name}`, {
             sessionId: session.id,
             action: 'rolling_recovery_success',
           });
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
-          this.logger.warn(\`Rolling recovery deferred for session: \${session.name}\`, {
+          this.logger.warn(`Rolling recovery deferred for session: ${session.name}`, {
             sessionId: session.id,
             action: 'rolling_recovery_deferred',
             error: message,
