@@ -102,6 +102,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private autoStartRun: Promise<void> = Promise.resolve();
   /** Set at the top of onModuleDestroy so the detached run stops launching further sessions. */
   private shuttingDown = false;
+  /** Periodic adoption sweep for sessions stranded by a rolling replacement. */
+  private takeoverSweep?: ReturnType<typeof globalThis.setInterval>;
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -179,6 +181,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
 
+    // A rolling replacement deliberately starts the new container before the old one exits. At
+    // bootstrap the old process still owns its sessions, so the one-shot auto-start scan must leave
+    // them alone. Once the old container exits its lease either gets released or expires; keep
+    // sweeping for those authenticated orphans so the replacement adopts them without operator
+    // intervention. claim() remains the final fence, so concurrent replacements cannot both start
+    // the same WhatsApp account.
+    this.takeoverSweep = globalThis.setInterval(() => {
+      void this.recoverLapsedSessions();
+    }, 15_000);
+    this.takeoverSweep.unref?.();
+
     // DETACHED, deliberately. Nest binds the HTTP listener only after every onApplicationBootstrap
     // hook has settled, and this loop's duration is unbounded: one engine initialization is at least
     // 60s (resolveEngineInitTimeoutMs) and there is a 2s throttle between sessions, so a host with
@@ -247,10 +260,48 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
   }
 
+  private async recoverLapsedSessions(): Promise<void> {
+    if (this.shuttingDown || !this.ownership) return;
+    try {
+      const lapsed = (await this.ownership.lapsedHeldByOthers()).filter(
+        session => session.phone != null && session.status !== SessionStatus.CREATED,
+      );
+      for (const session of lapsed) {
+        if (this.shuttingDown) return;
+        try {
+          // A dead owner's READY/INITIALIZING status describes an engine that no longer exists.
+          // Reset only this lapsed row before start(); start() then atomically claims it.
+          await this.sessionRepository.update(session.id, { status: SessionStatus.DISCONNECTED });
+          await this.start(session.id);
+          this.logger.log(`Recovered lapsed session after rolling replacement: ${session.name}`, {
+            sessionId: session.id,
+            action: 'rolling_recovery_success',
+          });
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logger.warn(`Rolling recovery deferred for session: ${session.name}`, {
+            sessionId: session.id,
+            action: 'rolling_recovery_deferred',
+            error: message,
+          });
+        }
+      }
+    } catch (error: unknown) {
+      this.logger.warn('Rolling recovery sweep failed', {
+        action: 'rolling_recovery_scan_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
     // Stop the watchdog FIRST (before any teardown below can hang): no new probe/disconnect handling
     // may start mid-shutdown. stop() is idempotent, so a second onModuleDestroy call stays safe.
     this.shuttingDown = true;
+    if (this.takeoverSweep) {
+      globalThis.clearInterval(this.takeoverSweep);
+      this.takeoverSweep = undefined;
+    }
     this.watchdog.stop();
     this.ownership?.stopHeartbeat();
     // A SIGTERM during boot can land while the detached auto-start is mid-launch. Let that one
